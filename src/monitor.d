@@ -632,7 +632,37 @@ final class Monitor {
 	}
 
 	// Update
-	void update(bool useCallbacks = true) {
+	void update(bool useCallbacks = true, string invocationSource = "unspecified", string parentLogKey = "") {
+		// Observation-only counters for this invocation
+		size_t readBatchCount = 0;
+		size_t eventBatchCount = 0;
+		size_t bytesRead = 0;
+		size_t rawEventCount = 0;
+		size_t ignoredEventCount = 0;
+		size_t filteredEventCount = 0;
+		size_t movedFromEventCount = 0;
+		size_t movedToEventCount = 0;
+		size_t createEventCount = 0;
+		size_t deleteEventCount = 0;
+		size_t closeWriteEventCount = 0;
+		size_t suppressedMoveDeleteCount = 0;
+		size_t queuedActionCount = 0;
+		size_t skippedActionCount = 0;
+		size_t executableMoveActionCount = 0;
+		size_t executableDeleteActionCount = 0;
+		size_t executableCreateDirActionCount = 0;
+		size_t executableChangedActionCount = 0;
+		size_t unmatchedMoveFromCount = 0;
+
+		// Always emit the summary when leaving this function in debug mode, including exception paths
+		scope(exit) {
+			if (debugLogging) {
+				addLogEntry("inotify processing summary context: source=" ~ invocationSource ~ ", useCallbacks=" ~ to!string(useCallbacks) ~ ", parentLogKey=" ~ (parentLogKey.empty ? "not-set" : parentLogKey), ["debug"]);
+				addLogEntry("inotify processing summary events: readBatches=" ~ to!string(readBatchCount) ~ ", eventBatches=" ~ to!string(eventBatchCount) ~ ", bytesRead=" ~ to!string(bytesRead) ~ ", rawEvents=" ~ to!string(rawEventCount) ~ ", ignoredEvents=" ~ to!string(ignoredEventCount) ~ ", filteredEvents=" ~ to!string(filteredEventCount) ~ ", movedFrom=" ~ to!string(movedFromEventCount) ~ ", movedTo=" ~ to!string(movedToEventCount) ~ ", create=" ~ to!string(createEventCount) ~ ", delete=" ~ to!string(deleteEventCount) ~ ", closeWrite=" ~ to!string(closeWriteEventCount) ~ ", suppressedMoveDeletes=" ~ to!string(suppressedMoveDeleteCount), ["debug"]);
+				addLogEntry("inotify processing summary actions: queued=" ~ to!string(queuedActionCount) ~ ", skipped=" ~ to!string(skippedActionCount) ~ ", executableMoved=" ~ to!string(executableMoveActionCount) ~ ", executableDeleted=" ~ to!string(executableDeleteActionCount) ~ ", executableCreateDir=" ~ to!string(executableCreateDirActionCount) ~ ", executableChanged=" ~ to!string(executableChangedActionCount) ~ ", unmatchedMoveFrom=" ~ to!string(unmatchedMoveFromCount), ["debug"]);
+			}
+		}
+
 		if(!initialised)
 			return;
 	
@@ -652,10 +682,18 @@ final class Monitor {
 				hasNotification = true;
 				size_t length = read(worker.fd, buffer.ptr, buffer.length);
 				if (length == -1) throw new MonitorException("read failed");
+				readBatchCount++;
+				bytesRead += length;
 
 				int i = 0;
 				while (i < length) {
 					inotify_event *event = cast(inotify_event*) &buffer[i];
+					rawEventCount++;
+					if (event.mask & IN_MOVED_FROM) movedFromEventCount++;
+					if (event.mask & IN_MOVED_TO) movedToEventCount++;
+					if (event.mask & IN_CREATE) createEventCount++;
+					if (event.mask & IN_DELETE) deleteEventCount++;
+					if (event.mask & IN_CLOSE_WRITE) closeWriteEventCount++;
 					string path;
 					string evalPath;
 					
@@ -697,6 +735,7 @@ final class Monitor {
 					
 					// skip events that need to be ignored
 					if (event.mask & IN_IGNORED) {
+						ignoredEventCount++;
 						// forget the directory associated to the watch descriptor
 						inotifyMutex.lock();
 						try {
@@ -725,6 +764,7 @@ final class Monitor {
 						// This due to if the user has specified in skip_dir an exclusive path: '/path' - that is what must be matched
 						if (selectiveSync.isDirNameExcluded(evalPath)) {
 							// The path to evaluate matches a path that the user has configured to skip
+							filteredEventCount++;
 							goto skip;
 						}
 					} else {
@@ -732,6 +772,7 @@ final class Monitor {
 						// This due to if the user has specified in skip_file an exclusive path: '/path/file' - that is what must be matched
 						if (selectiveSync.isFileNameExcluded(evalPath)) {
 							// The path to evaluate matches a file that the user has configured to skip
+							filteredEventCount++;
 							goto skip;
 						}
 					}
@@ -739,6 +780,7 @@ final class Monitor {
 					// is the path, excluded via sync_list
 					if (selectiveSync.isPathExcludedViaSyncList(path)) {
 						// The path to evaluate matches a directory or file that the user has configured not to include in the sync
+						filteredEventCount++;
 						goto skip;
 					}
 					
@@ -778,6 +820,7 @@ final class Monitor {
 						}
 					} else if (event.mask & IN_DELETE) {
 						if (path in movedNotDeleted) {
+							suppressedMoveDeleteCount++;
 							movedNotDeleted.remove(path); // Ignore delete for moved files
 						} else {
 							if (debugLogging) {addLogEntry("event IN_DELETE: " ~ path, ["debug"]);}
@@ -809,10 +852,38 @@ final class Monitor {
 				}
 			}
 			if (!hasNotification) break;
+			eventBatchCount++;
+
+			// Record the queued action state before processChanges destroys the holder
+			foreach (action; actionHolder.actions) {
+				queuedActionCount++;
+				if (action.skipped) {
+					skippedActionCount++;
+					continue;
+				}
+				switch (action.type) {
+					case ActionType.moved:
+						executableMoveActionCount++;
+						break;
+					case ActionType.deleted:
+						executableDeleteActionCount++;
+						break;
+					case ActionType.createDir:
+						executableCreateDirActionCount++;
+						break;
+					case ActionType.changed:
+						executableChangedActionCount++;
+						break;
+					default:
+						break;
+				}
+			}
+
 			processChanges();
 
 			// Assume that the items moved outside the watched directory have been deleted
 			foreach (cookie, path; cookieToPath) {
+				unmatchedMoveFromCount++;
 				if (debugLogging) {addLogEntry("Deleting cookie|watch (post loop): " ~ path, ["debug"]);}
 				if (useCallbacks) onDelete(path);
 				remove(path);
