@@ -5,7 +5,6 @@ module monitor;
 import core.stdc.errno;
 import core.stdc.stdlib;
 import core.sys.linux.sys.inotify;
-import core.sys.posix.poll;
 import core.sys.posix.unistd;
 import core.sys.posix.sys.select;
 import core.thread;
@@ -53,16 +52,102 @@ class MonitorBackgroundWorker {
 	bool isAlive;
 	bool workerExited;
 
+	// The kernel queues at most 'fs.inotify.max_queued_events' (default 16384) events per
+	// inotify instance. Once exceeded the kernel raises IN_Q_OVERFLOW and discards events,
+	// and the only recovery is a full local rescan. That queue is drained solely by
+	// whichever thread calls read(), so any long-running operation on that thread puts the
+	// event stream at risk. This worker therefore reads continuously and buffers into user
+	// space, where the bound is ours to choose and the memory is pageable rather than
+	// pinned kernel allocation.
+	//
+	// Events are buffered exactly as the kernel delivered them. A read() always returns a
+	// whole number of events - the kernel never splits one across a read boundary - so each
+	// chunk is a self-contained sequence that the consumer can walk with the same pointer
+	// arithmetic as before. Copying the block once, rather than decoding each event into an
+	// owned structure, keeps this to one allocation per read() instead of one per event.
+	private ubyte[][] eventQueue;
+	private shared(Mutex) queueMutex;
+	private size_t queuedBytes;
+	private bool queueOverflowed;
+
+	// Bound the buffer by bytes rather than event count: inotify events are variable length,
+	// so a count gives no predictable ceiling on memory.
+	private enum size_t queueByteLimit = 64 * 1024 * 1024;
+
+	// The kernel never returns a partial event, so a large read buffer only reduces the
+	// syscall count.
+	private enum size_t readBufferSize = 256 * 1024;
+
 	this() {
 		isAlive = true;
 		workerExited = false;
 		p = pipe();
+		queueMutex = cast(shared)new Mutex();
 	}
 
 	shared void initialise() {
 		workerExited = false;
-		fd = inotify_init();
-		if (fd < 0) throw new MonitorException("inotify_init failed");
+		// IN_NONBLOCK so the drain loop can read until EAGAIN rather than blocking once the
+		// queue is empty.
+		fd = inotify_init1(IN_NONBLOCK);
+		if (fd < 0) throw new MonitorException("inotify_init1 failed");
+	}
+
+	// Append one read()'s worth of events. Taking the lock once per read rather than once
+	// per event keeps lock traffic negligible - a single 256 KiB read can carry thousands
+	// of events.
+	//
+	// A chunk that would breach the byte limit is rejected whole and the overflow latched.
+	// Accepting part of it would leave a silent hole in an ordered stream, which the
+	// consumer cannot detect and would process as though complete - a split IN_MOVED_FROM /
+	// IN_MOVED_TO pair would silently become a delete plus an unrelated create. Clean
+	// failure is preferable because it is visible.
+	private shared void enqueueChunk(ubyte[] chunk) {
+		if (chunk.length == 0) return;
+		auto self = cast(MonitorBackgroundWorker) this;
+		auto m = cast(Mutex) queueMutex;
+		m.lock();
+		scope(exit) m.unlock();
+
+		// Already latched - keep discarding until the consumer has taken the exception.
+		if (self.queueOverflowed) return;
+
+		if (self.queuedBytes + chunk.length > queueByteLimit) {
+			// Recovery from here is a full local rescan, so the events already held are
+			// worthless. Release them rather than sitting at the ceiling.
+			self.queueOverflowed = true;
+			self.eventQueue = null;
+			self.queuedBytes = 0;
+			return;
+		}
+
+		self.eventQueue ~= chunk;
+		self.queuedBytes += chunk.length;
+	}
+
+	// Hand the whole queue to the consumer in one operation. This moves a slice - a pointer
+	// and a length - so the cost is constant regardless of queue depth, and the lock is held
+	// for two assignments.
+	shared ubyte[][] takeEvents(out bool overflowed) {
+		auto self = cast(MonitorBackgroundWorker) this;
+		auto m = cast(Mutex) queueMutex;
+		m.lock();
+		scope(exit) m.unlock();
+
+		overflowed = self.queueOverflowed;
+		ubyte[][] taken = self.eventQueue;
+		self.eventQueue = null;
+		self.queuedBytes = 0;
+		self.queueOverflowed = false;
+		return taken;
+	}
+
+	shared bool hasQueuedEvents() {
+		auto self = cast(MonitorBackgroundWorker) this;
+		auto m = cast(Mutex) queueMutex;
+		m.lock();
+		scope(exit) m.unlock();
+		return (self.eventQueue.length > 0) || self.queueOverflowed;
 	}
 
 	// Add this path to be monitored
@@ -114,6 +199,27 @@ class MonitorBackgroundWorker {
 		return inotify_rm_watch(fd, wd);
 	}
 
+	// Read every event the kernel has available into the user space queue.
+	// Returns false only on an unrecoverable read error.
+	private shared bool drainInotifyDescriptor(void[] readBuffer) {
+		while (true) {
+			ptrdiff_t length = read(fd, readBuffer.ptr, readBuffer.length);
+
+			if (length < 0) {
+				// EAGAIN / EWOULDBLOCK simply means the kernel queue is now empty, which is
+				// the expected exit from this loop on a non-blocking descriptor.
+				if ((errno() == EAGAIN) || (errno() == EWOULDBLOCK) || (errno() == EINTR)) return true;
+				return false;
+			}
+
+			if (length == 0) return true;
+
+			// One copy of the block the kernel just handed us, so it survives the next
+			// read() overwriting the buffer and can be walked by the consumer thread.
+			enqueueChunk((cast(ubyte*) readBuffer.ptr)[0 .. cast(size_t) length].dup);
+		}
+	}
+
 	shared void watch(Tid callerTid) {
 		// On failure, send -1 to caller
 		int res;
@@ -126,6 +232,15 @@ class MonitorBackgroundWorker {
 		// wait for the caller to be ready
 		receiveOnly!bool();
 
+		// Allocated once and reused for the lifetime of the worker.
+		void[] readBuffer = new void[readBufferSize];
+
+		// The caller is notified once when events become available, and is not notified
+		// again until it has re-armed us. Reading, however, never stops: the whole purpose
+		// of this thread is that the kernel queue is drained irrespective of what the main
+		// thread happens to be doing.
+		bool notifyPending = false;
+
 		while (isAlive) {
 			fd_set fds;
 			FD_ZERO(&fds);
@@ -135,9 +250,20 @@ class MonitorBackgroundWorker {
 			int controlPipeFd = (cast()p).readEnd.fileno;
 			FD_SET(controlPipeFd, &fds);
 
+			// Whilst a notification is outstanding the caller may re-arm us at any moment,
+			// so poll rather than block indefinitely, otherwise the re-arm would not be
+			// noticed until the next filesystem event arrived.
+			timeval tv;
+			timeval* tvp = null;
+			if (notifyPending) {
+				tv.tv_sec = 0;
+				tv.tv_usec = 100_000;
+				tvp = &tv;
+			}
+
 			// select() only needs to scan up to the highest fd + 1.
 			int maxFd = max(fd, controlPipeFd) + 1;
-			res = select(maxFd, &fds, null, null, null);
+			res = select(maxFd, &fds, null, null, tvp);
 
 			if (res == -1) {
 				if (errno() == EINTR) {
@@ -153,7 +279,7 @@ class MonitorBackgroundWorker {
 			// Control-pipe readiness is not filesystem activity. It is used to
 			// unblock select() during interrupt/shutdown, so drain it and do not
 			// report a local monitor wake-up to main.d.
-			if (FD_ISSET(controlPipeFd, &fds)) {
+			if ((res > 0) && FD_ISSET(controlPipeFd, &fds)) {
 				try {
 					(cast()p).readEnd.readln();
 				} catch (Exception) {
@@ -164,16 +290,28 @@ class MonitorBackgroundWorker {
 				continue;
 			}
 
-			// Only inotify fd readiness should wake the caller for local
-			// filesystem processing.
-			if (FD_ISSET(fd, &fds)) {
+			// Drain the kernel queue into user space immediately, regardless of whether the
+			// caller is ready to process anything yet.
+			if ((res > 0) && FD_ISSET(fd, &fds)) {
+				if (!drainInotifyDescriptor(readBuffer)) {
+					callerTid.send(-1);
+					break;
+				}
+			}
+
+			// Notify the caller once per re-arm cycle that there is something to collect.
+			if (!notifyPending && hasQueuedEvents()) {
 				callerTid.send(1);
+				notifyPending = true;
+			}
 
-				// wait for the caller to be ready
-				if (isAlive)
-					isAlive = receiveOnly!bool();
-
-				continue;
+			// Has the caller re-armed us? Checked without blocking so that draining
+			// continues while the caller is busy.
+			if (notifyPending) {
+				bool rearmed = receiveTimeout(dur!"msecs"(0), (bool alive) {
+					isAlive = alive;
+				});
+				if (rearmed) notifyPending = false;
 			}
 		}
 	}
@@ -376,9 +514,7 @@ final class Monitor {
 	private bool monitorStateDirty = false;
 	// map the inotify cookies of move_from events to their path
 	private string[int] cookieToPath;
-	// buffer to receive the inotify events
-	private void[] buffer;
-	
+
 	// Mutex to support thread safe access of inotify watch descriptors
 	private Mutex inotifyMutex;
 
@@ -424,7 +560,6 @@ final class Monitor {
 		}
 		
 		assert(onDirCreated && onFileChanged && onDelete && onMove);
-		if (!buffer) buffer = new void[4096];
 		worker = cast(shared) new MonitorBackgroundWorker;
 		worker.initialise();
 
@@ -975,53 +1110,43 @@ final class Monitor {
 		return true;
 	}
 
-	private void drainPendingEventsOnly(ref pollfd fds) {
+	private void drainPendingEventsOnly() {
+		bool overflowed;
+		ubyte[][] chunks = worker.takeEvents(overflowed);
 		size_t drainedEvents = 0;
+		bool streamOverflow = false;
 
-		while (true) {
-			bool hasNotification = false;
-			int sleep_counter = 0;
+		// Do not resolve paths, update watches, evaluate filters, or invoke callbacks.
+		// This path is used when callers explicitly want queued local events cancelled.
+		foreach (chunk; chunks) {
+			size_t i = 0;
+			while (i < chunk.length) {
+				inotify_event* event = cast(inotify_event*) &chunk[i];
 
-			// Preserve the existing short batching window, but do not resolve paths,
-			// update watches, evaluate filters, or invoke callbacks. This path is
-			// used when callers explicitly want queued local events cancelled.
-			while (sleep_counter < 5) {
-				int ret = poll(&fds, 1, 0);
-				if (ret == -1) throw new MonitorException("poll failed");
-				else if (ret == 0) break;
-
-				hasNotification = true;
-				size_t length = read(worker.fd, buffer.ptr, buffer.length);
-				if (length == -1) throw new MonitorException("read failed");
-
-				int i = 0;
-				while (i < length) {
-					inotify_event *event = cast(inotify_event*) &buffer[i];
-
-					if (event.mask & IN_IGNORED) {
-						string ignoredPath;
-						unregisterWatchDescriptor(event.wd, ignoredPath);
-					} else if (event.mask & IN_Q_OVERFLOW) {
-						monitorStateDirty = true;
-						clearTransientEventState();
-						throw new MonitorException("inotify queue overflow: some events may be lost");
-					}
-
-					drainedEvents++;
-					i += inotify_event.sizeof + event.len;
+				if (event.mask & IN_IGNORED) {
+					string ignoredPath;
+					unregisterWatchDescriptor(event.wd, ignoredPath);
+				} else if (event.mask & IN_Q_OVERFLOW) {
+					// Delivered inline by the kernel, so it arrives in its correct position.
+					streamOverflow = true;
 				}
 
-				if (poll(&fds, 1, 0) == 0) {
-					sleep_counter += 1;
-					Thread.sleep(dur!"seconds"(1));
-				}
+				drainedEvents++;
+				i += inotify_event.sizeof + event.len;
 			}
-
-			if (!hasNotification) break;
 		}
 
 		if ((drainedEvents > 0) && debugLogging) {
 			addLogEntry("Drained " ~ drainedEvents.to!string ~ " stale local filesystem monitor event(s) without processing", ["debug"]);
+		}
+
+		// Even when discarding events, a lost-event condition must still be reported: the
+		// caller cannot know which events were dropped, so the monitor state is no longer
+		// trustworthy and only a full local rescan can restore it.
+		if (overflowed || streamOverflow) {
+			monitorStateDirty = true;
+			clearTransientEventState();
+			throw new MonitorException("inotify queue overflow: some events may be lost");
 		}
 	}
 
@@ -1029,36 +1154,61 @@ final class Monitor {
 	void update(bool useCallbacks = true, bool processDeletesWhenDraining = false) {
 		if(!initialised)
 			return;
-	
-		pollfd fds = {
-			fd: worker.fd,
-			events: POLLIN
-		};
 
 		if (!useCallbacks && !processDeletesWhenDraining) {
 			clearTransientEventState();
-			drainPendingEventsOnly(fds);
+			drainPendingEventsOnly();
 			return;
 		}
 
-		while (true) {
-			bool hasNotification = false;
-			int sleep_counter = 0;
-			// Batch events up to 5 seconds
-			while (sleep_counter < 5) {
-				int ret = poll(&fds, 1, 0);
-				if (ret == -1) throw new MonitorException("poll failed");
-				else if (ret == 0) break; // no events available
-				hasNotification = true;
-				size_t length = read(worker.fd, buffer.ptr, buffer.length);
-				if (length == -1) throw new MonitorException("read failed");
+		// Collect what the receiver thread has buffered. Events were read from the kernel as
+		// they arrived, so there is no need to linger here purely to batch them.
+		//
+		// There is however one case that does require waiting. An IN_MOVED_FROM that never
+		// finds its matching IN_MOVED_TO is treated as a deletion by the cleanup below, so a
+		// rename whose two halves land either side of a queue handover would delete the file
+		// online and then re-upload it. Whilst any move is outstanding, briefly wait for its
+		// partner.
+		//
+		// Unlike the batching window this replaces, waiting here does not starve the kernel
+		// queue - the receiver thread continues draining throughout - so it can be short and
+		// is only entered when a move is actually pending.
+		bool sawAnyEvents = false;
+		int settleAttempts = 0;
+		enum int maxSettleAttempts = 10;			// 10 x 50ms = 500ms worst case
 
-				int i = 0;
-				while (i < length) {
-					inotify_event *event = cast(inotify_event*) &buffer[i];
-					string path;
-					string evalPath;
-					
+		while (true) {
+			bool overflowed;
+			ubyte[][] chunks = worker.takeEvents(overflowed);
+
+			if (overflowed) {
+				// The user space buffer hit its ceiling, so events were discarded. The stream
+				// is no longer complete and only a full local rescan can restore the monitor
+				// state.
+				monitorStateDirty = true;
+				clearTransientEventState();
+				throw new MonitorException("inotify queue overflow: some events may be lost");
+			}
+
+			if (chunks.length == 0) {
+				if ((cookieToPath.length > 0) && (settleAttempts < maxSettleAttempts)) {
+					settleAttempts++;
+					Thread.sleep(dur!"msecs"(50));
+					continue;
+				}
+				break;
+			}
+
+			sawAnyEvents = true;
+			settleAttempts = 0;
+
+			foreach (chunk; chunks) {
+				size_t i = 0;
+				while (i < chunk.length) {
+					inotify_event* event = cast(inotify_event*) &chunk[i];
+			string path;
+			string evalPath;
+
 					// inotify event debug
 					if (debugLogging) {
 						addLogEntry("inotify event wd: " ~ to!string(event.wd), ["debug"]);
@@ -1067,7 +1217,7 @@ final class Monitor {
 						addLogEntry("inotify event len: " ~ to!string(event.len), ["debug"]);
 						addLogEntry("inotify event name: " ~ to!string(event.name), ["debug"]);
 					}
-					
+
 					// inotify event handling
 					if (debugLogging) {
 						if (event.mask & IN_ACCESS) addLogEntry("inotify event flag: IN_ACCESS", ["debug"]);
@@ -1140,7 +1290,7 @@ final class Monitor {
 					// is the path, excluded via sync_list
 					if (selectiveSync.isPathExcludedViaSyncList(path)) {
 						// The path to evaluate matches a directory or file that the user has configured not to include in the sync
-						goto skip;
+						continue;
 					}
 					
 					// handle the inotify events
@@ -1226,34 +1376,30 @@ final class Monitor {
 					skip:
 					i += inotify_event.sizeof + event.len;
 				}
-
-				// Sleep for one second to prevent missing fast-changing events.
-				if (poll(&fds, 1, 0) == 0) {
-					sleep_counter += 1;
-					Thread.sleep(dur!"seconds"(1));
-				}
 			}
-			if (!hasNotification) break;
-			processChanges();
-
-			// Assume that the items moved outside the watched directory have been deleted.
-			// Iterate over a copy because cookieToPath is mutated during cleanup.
-			auto cookieToPathCopy = cookieToPath.dup;
-			foreach (cookie, path; cookieToPathCopy) {
-				if (debugLogging) {addLogEntry("Deleting cookie|watch (post loop): " ~ path, ["debug"]);}
-				if (useCallbacks || processDeletesWhenDraining) onDelete(path);
-				removeWatchTree(path);
-				cookieToPath.remove(cookie);
-				movedNotDeleted.remove(path);
-			}
-
-			// Any lost delete/move events can leave stale watch entries behind. Prune
-			// against the current filesystem before the monitor loop goes idle again.
-			pruneStaleWatches();
-
-			// Debug Log that all inotify events are flushed
-			if (debugLogging) {addLogEntry("inotify events flushed", ["debug"]);}
 		}
+
+		if (!sawAnyEvents) return;
+
+		processChanges();
+
+		// Assume that the items moved outside the watched directory have been deleted.
+		// Iterate over a copy because cookieToPath is mutated during cleanup.
+		auto cookieToPathCopy = cookieToPath.dup;
+		foreach (cookie, path; cookieToPathCopy) {
+			if (debugLogging) {addLogEntry("Deleting cookie|watch (post loop): " ~ path, ["debug"]);}
+			if (useCallbacks || processDeletesWhenDraining) onDelete(path);
+			removeWatchTree(path);
+			cookieToPath.remove(cookie);
+			movedNotDeleted.remove(path);
+		}
+
+		// Any lost delete/move events can leave stale watch entries behind. Prune
+		// against the current filesystem before the monitor loop goes idle again.
+		pruneStaleWatches();
+
+		// Debug Log that all inotify events are flushed
+		if (debugLogging) {addLogEntry("inotify events flushed", ["debug"]);}
 	}
   
 	private void processChanges() {
