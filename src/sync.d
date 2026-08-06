@@ -91,7 +91,18 @@ class SyncEngine {
 	ApplicationConfig appConfig;
 	ItemDatabase itemDB;
 	ClientSideFiltering selectiveSync;
-	
+
+	// Set by main.d in monitor mode so the sync engine can ask whether a local deletion for a
+	// given path has been observed but not yet processed. Null outside monitor mode, where
+	// there is no filesystem monitor and therefore nothing pending.
+	//
+	// /delta processing and local event processing run in separate phases, so a deletion can
+	// be observed, wait in the queue whilst a /delta pass runs, and only be acted upon
+	// afterwards. Without this, that /delta pass sees the item present online and missing
+	// locally, concludes the local copy needs repairing, and recreates what the user has just
+	// deleted.
+	bool delegate(string path) hasPendingLocalDeletion;
+
 	// Array of directory databaseItem.id to skip while applying the changes.
 	// These are the 'parent path' id's that are being excluded, so if the parent id is in here, the child needs to be skipped as well
 	RedBlackTree!string skippedItems = redBlackTree!string();
@@ -2798,9 +2809,26 @@ class SyncEngine {
 						if (!exists(existingItemPath)) {
 							// Path does not exist locally, but exists in database
 							if (!generatedSimulatedDeltaResponse) {
-								// We did not generate a simulated /delta response ... 
-								if (debugLogging) {addLogEntry("existingItemPath does not exist - we need to create it: " ~ existingItemPath, ["debug"]);}
-								handleLocalDirectoryCreation(existingDatabaseItem, existingItemPath, onedriveJSONItem);
+								// We did not generate a simulated /delta response ...
+								//
+								// Before treating local absence as damage to repair, check whether it
+								// is instead a deletion this client has already observed and has yet
+								// to process. In monitor mode the local event queue is drained in a
+								// separate phase from /delta processing, so a directory the user has
+								// just removed can still be reported as present online here. Recreating
+								// it in that window restores data the user deleted, and the subsequent
+								// local-event pass then propagates the recreated directory back online,
+								// leaving both sides holding the deleted tree.
+								//
+								// The pending deletion is by definition the newer intent - it has not
+								// even been acted upon yet - so no clock comparison between the local
+								// filesystem and Microsoft's timestamps is needed to order the two.
+								if ((hasPendingLocalDeletion !is null) && hasPendingLocalDeletion(existingItemPath)) {
+									if (debugLogging) {addLogEntry("existingItemPath does not exist locally, but a local deletion for it is pending - not recreating: " ~ existingItemPath, ["debug"]);}
+								} else {
+									if (debugLogging) {addLogEntry("existingItemPath does not exist - we need to create it: " ~ existingItemPath, ["debug"]);}
+									handleLocalDirectoryCreation(existingDatabaseItem, existingItemPath, onedriveJSONItem);
+								}
 							}
 						}
 					}

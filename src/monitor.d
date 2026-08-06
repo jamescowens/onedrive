@@ -150,6 +150,16 @@ class MonitorBackgroundWorker {
 		return (self.eventQueue.length > 0) || self.queueOverflowed;
 	}
 
+	// Inspect the queued events WITHOUT consuming them. Only the array of slices is copied,
+	// not the event data, so this is cheap even with a deep queue.
+	shared ubyte[][] peekEvents() {
+		auto self = cast(MonitorBackgroundWorker) this;
+		auto m = cast(Mutex) queueMutex;
+		m.lock();
+		scope(exit) m.unlock();
+		return self.eventQueue.dup;
+	}
+
 	// Add this path to be monitored
 	shared int addInotifyWatch(string pathname) {
 		int wd = inotify_add_watch(fd, toStringz(pathname), mask);
@@ -1078,18 +1088,15 @@ final class Monitor {
 	}
 
 	// Return the file path from an inotify event
-	private bool getPath(const(inotify_event)* event, out string path) {
+	// Resolve an event to its path without logging. Used both by getPath() and by the
+	// pending-deletion peek, which walks the queue repeatedly and must not narrate it.
+	private bool resolveEventPath(const(inotify_event)* event, out string path) {
 		path = null;
 
 		inotifyMutex.lock();
 		try {
 			auto dirname = event.wd in wdToDirName;
 			if (dirname is null) {
-				// Under heavy churn or shutdown, inotify can still deliver queued
-				// events for a watch descriptor that has already been removed from
-				// the internal map. Treat those as stale events rather than allowing
-				// associative-array indexing to raise a RangeError.
-				if (debugLogging) {addLogEntry("Ignoring stale inotify event for removed watch descriptor: wd=" ~ event.wd.to!string ~ ", mask=" ~ event.mask.to!string, ["debug"]);}
 				return false;
 			}
 
@@ -1106,8 +1113,79 @@ final class Monitor {
 			path = path[0 .. $-1];
 		}
 
+		return true;
+	}
+
+	private bool getPath(const(inotify_event)* event, out string path) {
+		if (!resolveEventPath(event, path)) {
+			// Under heavy churn or shutdown, inotify can still deliver queued events for a
+			// watch descriptor that has already been removed from the internal map. Treat
+			// those as stale events rather than allowing associative-array indexing to
+			// raise a RangeError.
+			if (debugLogging) {addLogEntry("Ignoring stale inotify event for removed watch descriptor: wd=" ~ event.wd.to!string ~ ", mask=" ~ event.mask.to!string, ["debug"]);}
+			return false;
+		}
+
 		if (debugLogging) {addLogEntry("inotify path event for: " ~ path, ["debug"]);}
 		return true;
+	}
+
+	// Strip the leading './' and any trailing '/' so that paths originating from the monitor
+	// and from the sync engine can be compared on equal terms.
+	private string normalisePathForComparison(string path) {
+		string p = path;
+		while (p.startsWith("./")) p = p[2 .. $];
+		while ((p.length > 1) && p.endsWith("/")) p = p[0 .. $-1];
+		if (p == ".") return null;
+		return p;
+	}
+
+	// Has a local deletion for this path - or for a directory containing it - been observed
+	// but not yet acted upon?
+	//
+	// Between observing an inotify delete and processing it, the client can run a /delta
+	// pass which finds the item present online and absent locally, and "repairs" the local
+	// copy by recreating it. That repair is wrong: the deletion is the newer intent and is
+	// already in hand, merely not yet processed. Consulting the outstanding work avoids
+	// acting on a view that is known to be stale, without needing to compare the local clock
+	// against Microsoft's.
+	bool hasPendingLocalDeletion(string path) {
+		if (!initialised) return false;
+		string target = normalisePathForComparison(path);
+		if (target is null) return false;
+
+		// 1. Observed by the receiver thread, not yet dispatched.
+		foreach (chunk; worker.peekEvents()) {
+			size_t i = 0;
+			while (i < chunk.length) {
+				inotify_event* event = cast(inotify_event*) &chunk[i];
+				if (event.mask & (IN_DELETE | IN_MOVED_FROM)) {
+					string eventPath;
+					if (resolveEventPath(event, eventPath)) {
+						string candidate = normalisePathForComparison(eventPath);
+						if (candidate !is null) {
+							if ((candidate == target) || isSameOrChildWatchPath(candidate, target)) {
+								return true;
+							}
+						}
+					}
+				}
+				i += inotify_event.sizeof + event.len;
+			}
+		}
+
+		// 2. Dispatched into the action queue, not yet executed.
+		foreach (action; actionHolder.actions) {
+			if (action.skipped) continue;
+			if (action.type != ActionType.deleted) continue;
+			string candidate = normalisePathForComparison(action.src);
+			if (candidate is null) continue;
+			if ((candidate == target) || isSameOrChildWatchPath(candidate, target)) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private void drainPendingEventsOnly() {

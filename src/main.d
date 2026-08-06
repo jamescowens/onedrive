@@ -1177,7 +1177,14 @@ int main(string[] cliArgs) {
 			
 			// Configure the monitor class
 			filesystemMonitor = new Monitor(appConfig, selectiveSync);
-			
+
+			// Let the sync engine ask whether a local deletion for a path has been observed but
+			// not yet processed, so that a /delta pass does not recreate something the user has
+			// just deleted whilst that deletion is still queued.
+			syncEngineInstance.hasPendingLocalDeletion = delegate(string path) {
+				return filesystemMonitor.hasPendingLocalDeletion(path);
+			};
+
 			// Delegated function for when inotify detects a new local directory has been created
 			filesystemMonitor.onDirCreated = delegate(string path) {
 				// Handle .folder creation if skip_dotfiles is enabled
