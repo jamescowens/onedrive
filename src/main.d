@@ -1869,6 +1869,20 @@ void performStandardSyncProcess(string localPath, Monitor filesystemMonitor = nu
 			// unset 'resync' now that everything has been performed
 			appConfig.setValueBool("resync" , false);
 		}
+
+		// A full sync cycle has now re-established local truth by walking the filesystem and
+		// reconciling it against both the database and the online state. Any events lost to
+		// an earlier overflow no longer matter, so clear the incomplete-observation flag.
+		//
+		// Whilst that flag is set, hasPendingLocalDeletion() answers conservatively and
+		// declines to recreate locally absent directories, because a deletion may have been
+		// among the discarded events. Leaving it set indefinitely would stop genuinely
+		// missing directories from ever being restored, so it must be cleared once the state
+		// has been rebuilt from an authoritative pass.
+		if ((filesystemMonitor !is null) && filesystemMonitor.isMonitorStateDirty()) {
+			if (verboseLogging) {addLogEntry("Local monitor observation completeness restored by full sync cycle", ["verbose"]);}
+			filesystemMonitor.clearMonitorStateDirty();
+		}
 	}
 }
 

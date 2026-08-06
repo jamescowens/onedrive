@@ -1151,6 +1151,26 @@ final class Monitor {
 	// against Microsoft's.
 	bool hasPendingLocalDeletion(string path) {
 		if (!initialised) return false;
+
+		// If observation completeness has been lost - either the kernel raised
+		// IN_Q_OVERFLOW or the user space buffer hit its ceiling - then events were
+		// discarded and the queue was emptied. A deletion may have been among them, and
+		// there is no way to tell.
+		//
+		// Answer conservatively rather than answering 'no'. Answering 'no' would silently
+		// restore the pre-fix behaviour precisely when it is most likely to bite, since
+		// overflow only occurs under heavy local churn, which is exactly when deletions are
+		// most likely to be in flight.
+		//
+		// The two possible errors are not equally bad. Declining to recreate a directory
+		// that really is missing locally leaves it missing until the next scan restores it.
+		// Recreating a directory the user deleted restores data they removed and then
+		// propagates it back online, which is silent and not obviously recoverable.
+		if (monitorStateDirty) {
+			if (debugLogging) {addLogEntry("Local monitor state is incomplete after lost events - treating '" ~ path ~ "' as possibly pending deletion", ["debug"]);}
+			return true;
+		}
+
 		string target = normalisePathForComparison(path);
 		if (target is null) return false;
 
