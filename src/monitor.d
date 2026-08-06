@@ -279,29 +279,56 @@ struct ActionHolder {
 					}
 				}
 
-				if (src in srcMap) {
-					size_t pendingTarget = srcMap[src];
-					// Skip operations require reading local file that is gone
-					switch (actions[pendingTarget].type) {
-						case ActionType.changed:
-						case ActionType.createDir:
-							actions[srcMap[src]].skipped = true;
-							srcMap.remove(src);
-							break;
-						default:
-							break;
-					}
-				}
-
-				// If a parent directory delete arrives after child deletes, collapse the
-				// child delete actions into the parent delete. Linux commonly reports
-				// rm -rf as file deletes followed by the directory delete. Processing
-				// only the parent preserves the intended recursive delete operation and
-				// avoids leaving empty remote directories behind if child deletes were
-				// observed first.
+				// Skip operations that require reading a local file that is now gone. This
+				// must cover everything beneath the deleted path, not merely the exact path.
+				//
+				// Cancelling only the exact path leaves pending creates for descendants
+				// alive, and they are then executed - creating directories online beneath a
+				// tree that has just been deleted locally. The exact-path form is not
+				// sufficient in either of the two ways a subtree is removed:
+				//
+				//   - when individual child deletes never arrive (for example when events
+				//     were lost), there is nothing to match those child creates against;
+				//   - when they do arrive, the loop below deliberately collapses them into
+				//     this parent delete, so they are no longer available to cancel anything.
+				//
+				// It also matters after a move. ActionType.moved defers pending creates by
+				// rebasing them onto the destination and re-appending them, so a subsequent
+				// delete of that destination must cancel the rebased entries too.
+				// Everything beneath the deleted path is resolved in a single pass. Both
+				// cases below test the same subtree predicate, and this runs per delete
+				// event over a list that grows with them, so walking it twice would double
+				// the cost of an already quadratic path on a large recursive delete.
 				foreach (ref action; actions) {
 					if (action.skipped) continue;
-					if (action.type == ActionType.deleted && isSameOrChildPath(src, action.src) && normaliseMonitorPath(src) != normaliseMonitorPath(action.src)) {
+					if (!isSameOrChildPath(src, action.src)) continue;
+
+					if ((action.type == ActionType.changed) || (action.type == ActionType.createDir)) {
+						// Skip operations that require reading a local file that is now gone.
+						// This must cover descendants, not merely the exact path: cancelling
+						// only the exact path leaves pending creates for children alive, and
+						// they are then executed - creating directories online beneath a tree
+						// that has just been deleted locally.
+						//
+						// The exact-path form is insufficient in either of the two ways a
+						// subtree is removed. When individual child deletes never arrive (for
+						// example when events were lost) there is nothing to match those child
+						// creates against; and when they do arrive, the collapse below folds
+						// them into this parent delete, so they are no longer available to
+						// cancel anything.
+						//
+						// It also matters after a move: ActionType.moved defers pending creates
+						// by rebasing them onto the destination and re-appending them, so a
+						// later delete of that destination must cancel the rebased entries too.
+						action.skipped = true;
+						srcMap.remove(action.src);
+					} else if ((action.type == ActionType.deleted) && (normaliseMonitorPath(src) != normaliseMonitorPath(action.src))) {
+						// If a parent directory delete arrives after child deletes, collapse the
+						// child delete actions into the parent delete. Linux commonly reports
+						// rm -rf as file deletes followed by the directory delete. Processing
+						// only the parent preserves the intended recursive delete operation and
+						// avoids leaving empty remote directories behind if child deletes were
+						// observed first.
 						action.skipped = true;
 						srcMap.remove(action.src);
 					}
